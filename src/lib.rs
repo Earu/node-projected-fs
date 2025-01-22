@@ -48,15 +48,28 @@ impl JsFuseFS {
 	}
 
 	#[napi]
-	pub async fn mount(&self, path: String) -> Result<()> {
+	pub async fn mount(&self, path: String, total_space_bytes: i64, max_files: Option<i64>) -> Result<()> {
+		if total_space_bytes <= 0 {
+			return Err(Error::from_reason("total_space_bytes must be greater than 0"));
+		}
+
 		let mount_path = PathBuf::from(path);
 		*self.mount_path.lock().await = Some(mount_path.clone());
 
 		let (tx, rx) = tokio::sync::oneshot::channel();
 		*self.unmount_sender.lock().await = Some(tx);
 
+		// Configure the filesystem before spawning the thread
+		{
+			let mut fs = self.inner.lock().await;
+			*fs = FSImpl::with_size(
+				self.state.clone(),
+				total_space_bytes as u64,
+				max_files.map(|x| x as u64).unwrap_or(1024 * 1024),
+			);
+		}
+
 		let inner = self.inner.clone();
-		
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Runtime::new().unwrap();
 			rt.block_on(async {
@@ -80,6 +93,20 @@ impl JsFuseFS {
 	#[napi]
 	pub async fn add_file(&self, path: String, content: Buffer) -> Result<()> {
 		let mut state = self.state.write().await;
+		
+		// Calculate current total size
+		let total_size: u64 = state.files.values()
+			.map(|file| file.size)
+			.sum();
+		
+		// Get the configured size limit
+		let size_limit = self.inner.lock().await.total_space_bytes;
+		
+		// Check if adding this file would exceed the limit
+		if total_size + content.len() as u64 > size_limit {
+			return Err(Error::from_reason("No space left on device"));
+		}
+
 		state.files.insert(path.clone(), common::VirtualFile {
 			content: content.to_vec(),
 			size: content.len() as u64,

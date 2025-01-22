@@ -19,9 +19,11 @@ async function main() {
 		await fs.addDirectory("subdir");
 		await fs.addFile("subdir/test.txt", Buffer.from("Test file in subdir\n"));
 
-		// Mount the filesystem
-		await fs.mount(process.env.HOME + '/fuse-mount');
+		// Mount the filesystem with 100MB RAM allocation
+		const RAM_SIZE = 100 * 1024 * 1024; // 100MB in bytes
+		await fs.mount(process.env.HOME + '/fuse-mount', RAM_SIZE);
 		console.log('Filesystem mounted at ' + process.env.HOME + '/fuse-mount');
+		console.log('RAM allocated: ' + (RAM_SIZE / 1024 / 1024) + 'MB');
 		
 		// Test file operations while mounted
 		setTimeout(async () => {
