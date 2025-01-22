@@ -1,14 +1,26 @@
 use crate::common::{SharedFSState, FSEvent, ObjectType};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use fuser::{
 	FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-	Request, ReplyWrite, ReplyCreate,
+	Request, ReplyWrite, ReplyCreate, TimeOrNow,
 };
 use napi::bindgen_prelude::*;
 
 const TTL: Duration = Duration::from_secs(1);
+
+// Get current user's UID and GID
+fn get_user_ids() -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        (unsafe { libc::getuid() }, unsafe { libc::getgid() })
+    }
+    #[cfg(not(unix))]
+    {
+        (1000, 1000)
+    }
+}
 
 pub struct FSImpl {
 	session: Option<fuser::BackgroundSession>,
@@ -26,7 +38,6 @@ impl FSImpl {
 	pub async fn mount(&mut self, mount_path: &Path) -> Result<()> {
 		let options = vec![
 			MountOption::FSName("virtual".to_string()),
-			MountOption::AllowOther,
 			MountOption::DefaultPermissions,
 			MountOption::AutoUnmount,
 		];
@@ -61,6 +72,7 @@ impl Filesystem for VirtualFS {
 	fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
+			let (uid, gid) = get_user_ids();
 			
 			let parent_path = if parent == 1 {
 				String::new()
@@ -96,8 +108,8 @@ impl Filesystem for VirtualFS {
 					kind: if file.is_directory { FileType::Directory } else { FileType::RegularFile },
 					perm: if file.is_directory { 0o755 } else { 0o644 },
 					nlink: if file.is_directory { 2 } else { 1 },
-					uid: 1000,
-					gid: 1000,
+					uid,
+					gid,
 					rdev: 0,
 					flags: 0,
 					blksize: 512,
@@ -112,43 +124,53 @@ impl Filesystem for VirtualFS {
 	fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
+			let now = SystemTime::now();
 			
-			// Find the file path and type by inode
-			let (path, is_directory) = match state.files.iter().find(|(path, _)| hash_path(path) == ino) {
-				Some((path, file)) => (path.clone(), file.is_directory),
-				None => {
-					reply.error(libc::ENOENT);
-					return;
+			let mut found_path = None;
+			let mut is_dir = false;
+			
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					found_path = Some(path.clone());
+					break;
 				}
-			};
+			}
 
-			// Get mutable reference and update content
-			if let Some(file) = state.files.get_mut(&path) {
-				let start = offset as usize;
-				let end = start + data.len();
-				
-				if end > file.content.len() {
-					file.content.resize(end, 0);
+			if let Some(path) = found_path {
+				if let Some(file) = state.files.get_mut(&path) {
+					let start = offset as usize;
+					let end = start + data.len();
+					
+					// Ensure the file is large enough
+					if end > file.content.len() {
+						file.content.resize(end, 0);
+					}
+					
+					// Write the data
+					file.content[start..end].copy_from_slice(data);
+					file.size = file.content.len() as u64;
+					file.mtime = now;
+					is_dir = file.is_directory;
 				}
-				
-				file.content[start..end].copy_from_slice(data);
-				file.size = file.content.len() as u64;
-				
+
+				// Emit modification event outside the mutable borrow scope
 				state.emit_event(FSEvent::Modified { 
 					path,
-					object_type: if is_directory { ObjectType::Directory } else { ObjectType::File }
+					object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
 				});
 				
 				reply.written(data.len() as u32);
-			} else {
-				reply.error(libc::ENOENT);
+				return;
 			}
+			reply.error(libc::ENOENT);
 		});
 	}
 
 	fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
+			let (uid, gid) = get_user_ids();
+			let now = SystemTime::now();
 			
 			let parent_path = if parent == 1 {
 				String::new()
@@ -172,21 +194,22 @@ impl Filesystem for VirtualFS {
 				content: Vec::new(),
 				size: 0,
 				is_directory: false,
+				mtime: now,
 			};
 
 			let attr = FileAttr {
 				ino: hash_path(&path),
 				size: 0,
 				blocks: 1,
-				atime: UNIX_EPOCH,
-				mtime: UNIX_EPOCH,
-				ctime: UNIX_EPOCH,
-				crtime: UNIX_EPOCH,
+				atime: now,
+				mtime: now,
+				ctime: now,
+				crtime: now,
 				kind: FileType::RegularFile,
 				perm: 0o644,
 				nlink: 1,
-				uid: 1000,
-				gid: 1000,
+				uid,
+				gid,
 				rdev: 0,
 				flags: 0,
 				blksize: 512,
@@ -237,20 +260,23 @@ impl Filesystem for VirtualFS {
 	}
 
 	fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+		let (uid, gid) = get_user_ids();
+		let now = SystemTime::now();
+		
 		if ino == 1 {
 			let attr = FileAttr {
 				ino: 1,
 				size: 0,
 				blocks: 0,
-				atime: UNIX_EPOCH,
-				mtime: UNIX_EPOCH,
-				ctime: UNIX_EPOCH,
-				crtime: UNIX_EPOCH,
+				atime: now,
+				mtime: now,
+				ctime: now,
+				crtime: now,
 				kind: FileType::Directory,
 				perm: 0o755,
 				nlink: 2,
-				uid: 1000,
-				gid: 1000,
+				uid,
+				gid,
 				rdev: 0,
 				flags: 0,
 				blksize: 512,
@@ -267,15 +293,15 @@ impl Filesystem for VirtualFS {
 						ino,
 						size: file.size,
 						blocks: 1,
-						atime: UNIX_EPOCH,
-						mtime: UNIX_EPOCH,
-						ctime: UNIX_EPOCH,
-						crtime: UNIX_EPOCH,
+						atime: file.mtime,
+						mtime: file.mtime,
+						ctime: file.mtime,
+						crtime: file.mtime,
 						kind: if file.is_directory { FileType::Directory } else { FileType::RegularFile },
 						perm: if file.is_directory { 0o755 } else { 0o644 },
 						nlink: if file.is_directory { 2 } else { 1 },
-						uid: 1000,
-						gid: 1000,
+						uid,
+						gid,
 						rdev: 0,
 						flags: 0,
 						blksize: 512,
@@ -370,6 +396,154 @@ impl Filesystem for VirtualFS {
 				}
 			}
 			reply.ok();
+		});
+	}
+
+	fn setattr(
+		&mut self,
+		_req: &Request,
+		ino: u64,
+		mode: Option<u32>,
+		uid: Option<u32>,
+		gid: Option<u32>,
+		size: Option<u64>,
+		atime: Option<TimeOrNow>,
+		mtime: Option<TimeOrNow>,
+		_ctime: Option<SystemTime>,
+		_fh: Option<u64>,
+		_crtime: Option<SystemTime>,
+		_chgtime: Option<SystemTime>,
+		_bkuptime: Option<SystemTime>,
+		_flags: Option<u32>,
+		reply: ReplyAttr,
+	) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let mut state = self.state.write().await;
+			let (current_uid, current_gid) = get_user_ids();
+			let now = SystemTime::now();
+
+			let mut found_path = None;
+			let mut found_attr = None;
+			let mut should_emit_event = false;
+
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					found_path = Some(path.clone());
+					break;
+				}
+			}
+
+			if let Some(path) = found_path {
+				let mut is_dir = false;
+				if let Some(file) = state.files.get_mut(&path) {
+					// Handle file size changes (truncation)
+					if let Some(new_size) = size {
+						file.content.resize(new_size as usize, 0);
+						file.size = new_size;
+						file.mtime = now;
+						should_emit_event = true;
+					}
+
+					// Handle mtime updates
+					if let Some(mtime) = mtime {
+						match mtime {
+							TimeOrNow::Now => file.mtime = now,
+							TimeOrNow::SpecificTime(time) => file.mtime = time,
+						}
+					}
+
+					found_attr = Some(FileAttr {
+						ino,
+						size: file.size,
+						blocks: 1,
+						atime: match atime {
+							Some(TimeOrNow::Now) => now,
+							Some(TimeOrNow::SpecificTime(time)) => time,
+							None => file.mtime,
+						},
+						mtime: file.mtime,
+						ctime: file.mtime,
+						crtime: file.mtime,
+						kind: if file.is_directory { FileType::Directory } else { FileType::RegularFile },
+						perm: mode.unwrap_or(if file.is_directory { 0o755 } else { 0o644 }) as u16,
+						nlink: if file.is_directory { 2 } else { 1 },
+						uid: uid.unwrap_or(current_uid),
+						gid: gid.unwrap_or(current_gid),
+						rdev: 0,
+						flags: 0,
+						blksize: 512,
+					});
+
+					if should_emit_event {
+						is_dir = file.is_directory;
+					}
+				}
+
+				if should_emit_event {
+					state.emit_event(FSEvent::Modified { 
+						path,
+						object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
+					});
+				}
+			}
+
+			if let Some(attr) = found_attr {
+				reply.attr(&TTL, &attr);
+			} else {
+				reply.error(libc::ENOENT);
+			}
+		});
+	}
+
+	fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					reply.opened(0, flags as u32);
+					return;
+				}
+			}
+			reply.error(libc::ENOENT);
+		});
+	}
+
+	fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: fuser::ReplyEmpty) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					reply.ok();
+					return;
+				}
+			}
+			reply.error(libc::ENOENT);
+		});
+	}
+
+	fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: fuser::ReplyEmpty) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					reply.ok();
+					return;
+				}
+			}
+			reply.error(libc::ENOENT);
+		});
+	}
+
+	fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: fuser::ReplyEmpty) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			for (path, _) in state.files.iter() {
+				if hash_path(path) == ino {
+					reply.ok();
+					return;
+				}
+			}
+			reply.error(libc::ENOENT);
 		});
 	}
 }
