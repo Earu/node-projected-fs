@@ -9,7 +9,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
-use std::time::{SystemTime, Duration};
+use std::time::SystemTime;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
@@ -95,7 +95,7 @@ impl VirtualFS {
 	fn start(&mut self, mount_path: &Path) -> windows::core::Result<()> {
 		unsafe {
 			let root_path = mount_path.to_str().unwrap();
-			let mut instance_handle = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
+			let instance_handle = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
 
 			// Convert path to wide string and ensure it stays alive
 			let root_path_wide: Vec<u16> = root_path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -106,7 +106,6 @@ impl VirtualFS {
 				ContentID: [0; 128],   // Using zeros for now
 			};
 
-			println!("Marking directory as placeholder: {}", root_path);
 			let result = PrjMarkDirectoryAsPlaceholder(
 				PCWSTR(root_path_wide.as_ptr()),
 				None,  // No target path needed
@@ -115,11 +114,9 @@ impl VirtualFS {
 			);
 
 			if let Err(e) = result {
-				println!("Failed to mark directory as placeholder: {:?}", e);
 				return Err(e);
 			}
 
-			println!("Starting virtualization");
 			let callbacks = PRJ_CALLBACKS {
 				StartDirectoryEnumerationCallback: Some(Self::start_dir_enum),
 				EndDirectoryEnumerationCallback: Some(Self::end_dir_enum),
@@ -142,7 +139,6 @@ impl VirtualFS {
 			let state_ptr = Box::into_raw(Box::new(self.state.clone())) as *const std::ffi::c_void;
 			if let Ok(mut states) = INSTANCE_STATES.lock() {
 				let key = state_ptr as usize;
-				println!("Storing state with key: {}", key);
 				states.insert(key, self.state.clone());
 			}
 
@@ -153,15 +149,12 @@ impl VirtualFS {
 				Some(&options),
 			);
 
-			if let Err(e) = &result {
-				println!("Failed to start virtualization: {:?}", e);
+			if let Err(_) = &result {
 				// Clean up on error
 				if let Ok(mut states) = INSTANCE_STATES.lock() {
 					states.remove(&(state_ptr as usize));
 				}
-				unsafe { Box::from_raw(state_ptr as *mut SharedFSState); }
 			} else {
-				println!("Virtualization started successfully");
 				self.instance_handle = Some(instance_handle);
 			}
 
@@ -193,6 +186,8 @@ impl VirtualFS {
 					let object_type = if _is_directory.as_bool() { ObjectType::Directory } else { ObjectType::File };
 					let file_path = Self::get_string_from_pcwstr(_destination_file_name);
 
+					// Only emit deletion events for explicit file deletions
+					// Ignore notifications that might be from internal ProjFS operations
 					match _notification {
 						PRJ_NOTIFICATION_NEW_FILE_CREATED => {
 							state.emit_event(FSEvent::Created { path: file_path, object_type });
@@ -200,9 +195,13 @@ impl VirtualFS {
 						PRJ_NOTIFICATION_FILE_OVERWRITTEN | PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED => {
 							state.emit_event(FSEvent::Modified { path: file_path, object_type });
 						}
-						PRJ_NOTIFICATION_FILE_DELETED => {
-							state.emit_event(FSEvent::Deleted { path: file_path, object_type });
-						}
+						PRJ_NOTIFICATION_PRE_DELETE => {
+							// Only emit deletion if the file was actually in our state
+							let lookup_path = file_path.replace('\\', "/");
+							if state.files.contains_key(&lookup_path) {
+								state.emit_event(FSEvent::Deleted { path: file_path, object_type });
+							}
+						},
 						_ => {}
 					}
 				}
@@ -241,7 +240,6 @@ impl VirtualFS {
 		_search_expression: PCWSTR,
 		dir_entry_buffer_handle: PRJ_DIR_ENTRY_BUFFER_HANDLE,
 	) -> HRESULT {
-		println!("get_dir_enum called");
 		let guid_str = format!("{:?}", unsafe { *_enumeration_id });
 
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
@@ -250,8 +248,6 @@ impl VirtualFS {
 				if let Some(state) = state {
 					let state = state.read().await;
 					let parent_path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
-					println!("Enumerating directory: {}", parent_path);
-
 					let parent_path = parent_path.replace('/', "\\");
 
 					// Get current index for this enumeration
@@ -277,14 +273,11 @@ impl VirtualFS {
 						}
 					}
 
-					println!("Found {} children", children.len());
-
 					// If we've sent all entries, clean up and return STATUS_END_OF_FILE
 					if current_index >= children.len() {
 						if let Ok(mut states) = ENUM_STATES.lock() {
 							states.remove(&guid_str);
 						}
-						println!("All entries sent, returning STATUS_END_OF_FILE");
 						return HRESULT(-2147483633); // STATUS_END_OF_FILE
 					}
 
@@ -307,7 +300,7 @@ impl VirtualFS {
 						..Default::default()
 					};
 
-					let result = PrjFillDirEntryBuffer(
+					let _ = PrjFillDirEntryBuffer(
 						PCWSTR(name_wide.as_ptr()),
 						Some(&file_info),
 						dir_entry_buffer_handle,
@@ -330,28 +323,14 @@ impl VirtualFS {
 	unsafe extern "system" fn get_placeholder_info(
 		_callback_data: *const PRJ_CALLBACK_DATA,
 	) -> HRESULT {
-		println!("get_placeholder_info called");
-		unsafe {
-			println!("Callback handle: {}", (*_callback_data).NamespaceVirtualizationContext.0 as usize);
-		}
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
 			return rt.block_on(async move {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
 					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
-					println!("Looking up placeholder info for: {}", path);
-					println!("Files in state:");
-					for (p, file) in state.files.iter() {
-						println!("  {} ({})", p, if file.is_directory { "dir" } else { "file" });
-					}
 
-					let path = path.replace('/', "\\");
-					let lookup_path = path.replace('\\', "/");
-					println!("Converted path for lookup: {}", lookup_path);
-
-					if let Some(file) = state.files.get(&lookup_path) {
-						println!("Found file: {} ({})", lookup_path, if file.is_directory { "dir" } else { "file" });
+					if let Some(file) = state.files.get(&path) {
 						let placeholder_info = PRJ_PLACEHOLDER_INFO {
 							FileBasicInfo: PRJ_FILE_BASIC_INFO {
 								IsDirectory: BOOLEAN::from(file.is_directory),
@@ -391,25 +370,14 @@ impl VirtualFS {
 		_byte_offset: u64,
 		_length: u32,
 	) -> HRESULT {
-		println!("get_file_data called");
-		unsafe {
-			println!("Callback handle: {}", (*_callback_data).NamespaceVirtualizationContext.0 as usize);
-		}
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
 			return rt.block_on(async move {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
 					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
-					println!("Reading file data for: {}", path);
-					println!("Offset: {}, Length: {}", _byte_offset, _length);
 
-					let path = path.replace('/', "\\");
-					let lookup_path = path.replace('\\', "/");
-					println!("Converted path for lookup: {}", lookup_path);
-
-					if let Some(file) = state.files.get(&lookup_path) {
-						println!("Found file: {} (size: {})", lookup_path, file.size);
+					if let Some(file) = state.files.get(&path) {
 						let start = _byte_offset as usize;
 						let end = std::cmp::min(start + _length as usize, file.content.len());
 
@@ -447,18 +415,15 @@ impl VirtualFS {
 	fn get_state_from_context(callback_data: *const PRJ_CALLBACK_DATA) -> Option<SharedFSState> {
 		unsafe {
 			let context_ptr = (*callback_data).InstanceContext;
-			println!("Context pointer: {:?}", context_ptr);
 			if !context_ptr.is_null() {
 				// Instead of dereferencing and cloning, use the global map with the context pointer as key
 				if let Ok(states) = INSTANCE_STATES.lock() {
 					let key = context_ptr as usize;
 					states.get(&key).cloned()
 				} else {
-					println!("Failed to lock state map");
 					None
 				}
 			} else {
-				println!("Context pointer is null");
 				None
 			}
 		}
