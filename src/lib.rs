@@ -48,7 +48,7 @@ impl JsFuseFS {
 	}
 
 	#[napi]
-	pub async fn mount(&self, path: String, total_space_bytes: i64, max_files: Option<i64>) -> Result<()> {
+	pub async fn mount(&self, path: String, total_space_bytes: i64) -> Result<()> {
 		if total_space_bytes <= 0 {
 			return Err(Error::from_reason("total_space_bytes must be greater than 0"));
 		}
@@ -65,7 +65,7 @@ impl JsFuseFS {
 			*fs = FSImpl::with_size(
 				self.state.clone(),
 				total_space_bytes as u64,
-				max_files.map(|x| x as u64).unwrap_or(1024 * 1024),
+				1024 * 1024, // Default max files, not exposed to JS
 			);
 		}
 
