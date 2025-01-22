@@ -17,5 +17,8 @@
     "build": "napi build --platform",
     "dev": "npm run build && node example.js"
   },
-  "type": "commonjs"
-} 
+  "type": "commonjs",
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}
