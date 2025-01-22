@@ -29,6 +29,7 @@ impl FSImpl {
 			MountOption::FSName("virtual".to_string()),
 			MountOption::AllowOther,
 			MountOption::DefaultPermissions,
+			MountOption::AutoUnmount,
 		];
 		
 		let fs = VirtualFS {
@@ -59,15 +60,37 @@ struct VirtualFS {
 
 impl Filesystem for VirtualFS {
 	fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-		let parent_path = if parent == 1 { "" } else { todo!() };
-		let path = Path::new(parent_path).join(name);
-		let path_str = path.to_string_lossy().into_owned();
-
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
-			if let Some(file) = state.files.get(&path_str) {
+			
+			// Find the parent path
+			let parent_path = if parent == 1 {
+				String::new()
+			} else {
+				// Find the path that corresponds to this inode
+				let parent_path = state.files.iter()
+					.find(|(path, file)| file.is_directory && hash_path(path) == parent)
+					.map(|(path, _)| path.clone());
+				
+				match parent_path {
+					Some(path) => path,
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			// Construct the full path
+			let path = if parent_path.is_empty() {
+				name.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", parent_path, name.to_string_lossy())
+			};
+
+			if let Some(file) = state.files.get(&path) {
 				let attr = FileAttr {
-					ino: hash_path(&path_str),
+					ino: hash_path(&path),
 					size: file.size,
 					blocks: 1,
 					atime: UNIX_EPOCH,
@@ -75,8 +98,8 @@ impl Filesystem for VirtualFS {
 					ctime: UNIX_EPOCH,
 					crtime: UNIX_EPOCH,
 					kind: if file.is_directory { FileType::Directory } else { FileType::RegularFile },
-					perm: 0o444,
-					nlink: 1,
+					perm: if file.is_directory { 0o755 } else { 0o644 },
+					nlink: if file.is_directory { 2 } else { 1 },
 					uid: 1000,
 					gid: 1000,
 					rdev: 0,
@@ -101,7 +124,7 @@ impl Filesystem for VirtualFS {
 				ctime: UNIX_EPOCH,
 				crtime: UNIX_EPOCH,
 				kind: FileType::Directory,
-				perm: 0o555,
+				perm: 0o755,
 				nlink: 2,
 				uid: 1000,
 				gid: 1000,
@@ -126,8 +149,8 @@ impl Filesystem for VirtualFS {
 						ctime: UNIX_EPOCH,
 						crtime: UNIX_EPOCH,
 						kind: if file.is_directory { FileType::Directory } else { FileType::RegularFile },
-						perm: 0o444,
-						nlink: 1,
+						perm: if file.is_directory { 0o755 } else { 0o644 },
+						nlink: if file.is_directory { 2 } else { 1 },
 						uid: 1000,
 						gid: 1000,
 						rdev: 0,
@@ -174,24 +197,46 @@ impl Filesystem for VirtualFS {
 		offset: i64,
 		mut reply: ReplyDirectory,
 	) {
-		if ino != 1 {
-			reply.error(libc::ENOTDIR);
-			return;
-		}
-
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
+
+			// Find the directory path for this inode
+			let dir_path = if ino == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == ino) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOTDIR);
+						return;
+					}
+				}
+			};
+
 			let mut entries = vec![
-				(1, FileType::Directory, "."),
-				(1, FileType::Directory, ".."),
+				(ino, FileType::Directory, "."),
+				(if ino == 1 { 1 } else { hash_path(dir_path.rsplit('/').next().unwrap_or("")) }, FileType::Directory, ".."),
 			];
 
+			// Add entries in this directory
 			for (path, file) in state.files.iter() {
-				if !path.contains('/') {  // Only root level entries
+				if path == &dir_path {
+					continue;
+				}
+
+				let is_direct_child = if dir_path.is_empty() {
+					!path.contains('/')
+				} else {
+					path.starts_with(&format!("{}/", dir_path)) && 
+					path[dir_path.len()+1..].split('/').count() == 1
+				};
+
+				if is_direct_child {
+					let name = path.split('/').last().unwrap();
 					entries.push((
 						hash_path(path),
 						if file.is_directory { FileType::Directory } else { FileType::RegularFile },
-						path,
+						name,
 					));
 				}
 			}
