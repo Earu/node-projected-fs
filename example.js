@@ -21,24 +21,24 @@ async function main() {
 			console.log('Added dynamic.txt');
 		}, 5000);
 
-		// Keep the process running until explicitly terminated
-		await new Promise((resolve) => {
-			process.on('SIGINT', async () => {
-				console.log('Received SIGINT signal');
+		// Handle graceful shutdown
+		process.on('SIGINT', async () => {
+			console.log('\nUnmounting filesystem...');
+			try {
 				await fs.unmount();
-				console.log('Filesystem unmounted');
-				resolve();
-			});
-
-			process.on('SIGTERM', async () => {
-				console.log('Received SIGTERM signal');
-				await fs.unmount();
-				console.log('Filesystem unmounted');
-				resolve();
-			});
+				console.log('Filesystem unmounted successfully');
+				process.exit(0);
+			} catch (error) {
+				console.error('Error unmounting:', error);
+				process.exit(1);
+			}
 		});
 
-		process.exit(0);
+		console.log('Press Ctrl+C to unmount and exit');
+
+		// Keep the process alive by reading from stdin
+		process.stdin.resume();
+
 	} catch (error) {
 		console.error('Error:', error);
 		process.exit(1);
