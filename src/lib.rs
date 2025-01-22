@@ -2,6 +2,7 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use napi::threadsafe_function::ThreadsafeFunction;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,11 +13,18 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-use common::{SharedFSState, create_fs_state};
+use common::{SharedFSState, create_fs_state, FSEvent};
 #[cfg(unix)]
 use unix::FSImpl;
 #[cfg(windows)]
 use windows::FSImpl;
+
+#[napi(object)]
+pub struct FileSystemEvent {
+	pub event_type: String,
+	pub path: String,
+	pub object_type: String,
+}
 
 #[napi(js_name = "FuseFS")]
 pub struct JsFuseFS {
@@ -72,29 +80,73 @@ impl JsFuseFS {
 	#[napi]
 	pub async fn add_file(&self, path: String, content: Buffer) -> Result<()> {
 		let mut state = self.state.write().await;
-		state.files.insert(path, common::VirtualFile {
+		state.files.insert(path.clone(), common::VirtualFile {
 			content: content.to_vec(),
 			size: content.len() as u64,
 			is_directory: false,
 		});
+		state.emit_event(FSEvent::Created { path, object_type: common::ObjectType::File });
 		Ok(())
 	}
 
 	#[napi]
 	pub async fn add_directory(&self, path: String) -> Result<()> {
 		let mut state = self.state.write().await;
-		state.files.insert(path, common::VirtualFile {
+		state.files.insert(path.clone(), common::VirtualFile {
 			content: vec![],
 			size: 0,
 			is_directory: true,
 		});
+		state.emit_event(FSEvent::Created { path, object_type: common::ObjectType::Directory });
 		Ok(())
 	}
 
 	#[napi]
 	pub async fn remove_path(&self, path: String) -> Result<()> {
 		let mut state = self.state.write().await;
-		state.files.remove(&path);
+		if let Some(file) = state.files.remove(&path) {
+			state.emit_event(FSEvent::Deleted { path, object_type: file.get_type() });
+		}
+		Ok(())
+	}
+
+	#[napi(js_name = "on")]
+	pub fn on_fs_event(&self, callback: JsFunction) -> Result<()> {
+		let state = self.state.clone();
+		let tsfn: ThreadsafeFunction<_, napi::threadsafe_function::ErrorStrategy::Fatal> = 
+			callback.create_threadsafe_function(0, |ctx| {
+				let event = ctx.value;
+				Ok(vec![event])
+			})?;
+
+		std::thread::spawn(move || {
+			let rt = tokio::runtime::Runtime::new().unwrap();
+			rt.block_on(async move {
+				let state = state.read().await;
+				let mut rx = state.subscribe_to_events();
+				drop(state);
+
+				while let Ok(event) = rx.recv().await {
+					let (event_type, path, object_type) = match event {
+						FSEvent::Created { path, object_type } => ("created", path, object_type),
+						FSEvent::Modified { path, object_type } => ("modified", path, object_type),
+						FSEvent::Deleted { path, object_type } => ("deleted", path, object_type),
+					};
+
+					let js_event = FileSystemEvent {
+						event_type: event_type.to_string(),
+						path,
+						object_type: match object_type {
+							common::ObjectType::File => "file".to_string(),
+							common::ObjectType::Directory => "directory".to_string(),
+						},
+					};
+
+					let _ = tsfn.call(js_event, napi::threadsafe_function::ThreadsafeFunctionCallMode::Blocking);
+				}
+			});
+		});
+
 		Ok(())
 	}
 } 

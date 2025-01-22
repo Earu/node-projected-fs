@@ -14,7 +14,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --platform"
+    "build": "napi build --platform",
+    "dev": "npm run build && node example.js"
   },
   "type": "commonjs"
 } 
