@@ -9,6 +9,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use std::time::{SystemTime, Duration};
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
@@ -24,6 +25,9 @@ static PROVIDER_GUID: GUID = GUID::from_values(
 // Global state mapping using the raw pointer value as the key
 static INSTANCE_STATES: Lazy<Mutex<HashMap<usize, SharedFSState>>> =
 	Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Add this near the top with other statics
+static ENUM_STATES: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub struct FSImpl {
 	session: Option<VirtualFS>,
@@ -91,7 +95,7 @@ impl VirtualFS {
 	fn start(&mut self, mount_path: &Path) -> windows::core::Result<()> {
 		unsafe {
 			let root_path = mount_path.to_str().unwrap();
-			let instance_handle = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
+			let mut instance_handle = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
 
 			// Convert path to wide string and ensure it stays alive
 			let root_path_wide: Vec<u16> = root_path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -102,6 +106,7 @@ impl VirtualFS {
 				ContentID: [0; 128],   // Using zeros for now
 			};
 
+			println!("Marking directory as placeholder: {}", root_path);
 			let result = PrjMarkDirectoryAsPlaceholder(
 				PCWSTR(root_path_wide.as_ptr()),
 				None,  // No target path needed
@@ -110,9 +115,11 @@ impl VirtualFS {
 			);
 
 			if let Err(e) = result {
+				println!("Failed to mark directory as placeholder: {:?}", e);
 				return Err(e);
 			}
 
+			println!("Starting virtualization");
 			let callbacks = PRJ_CALLBACKS {
 				StartDirectoryEnumerationCallback: Some(Self::start_dir_enum),
 				EndDirectoryEnumerationCallback: Some(Self::end_dir_enum),
@@ -131,19 +138,30 @@ impl VirtualFS {
 				NotificationMappingsCount: 0,
 			};
 
+			// Store state in global map before starting virtualization
+			let state_ptr = Box::into_raw(Box::new(self.state.clone())) as *const std::ffi::c_void;
+			if let Ok(mut states) = INSTANCE_STATES.lock() {
+				let key = state_ptr as usize;
+				println!("Storing state with key: {}", key);
+				states.insert(key, self.state.clone());
+			}
+
 			let result = PrjStartVirtualizing(
 				PCWSTR(root_path_wide.as_ptr()),
 				&callbacks,
-				Some(&instance_handle as *const _ as *const std::ffi::c_void),
+				Some(state_ptr),
 				Some(&options),
 			);
 
-			if result.is_ok() {
-				// Store the state in the global map using the handle's pointer value as key
+			if let Err(e) = &result {
+				println!("Failed to start virtualization: {:?}", e);
+				// Clean up on error
 				if let Ok(mut states) = INSTANCE_STATES.lock() {
-					let key = instance_handle.0 as usize;
-					states.insert(key, self.state.clone());
+					states.remove(&(state_ptr as usize));
 				}
+				unsafe { Box::from_raw(state_ptr as *mut SharedFSState); }
+			} else {
+				println!("Virtualization started successfully");
 				self.instance_handle = Some(instance_handle);
 			}
 
@@ -154,11 +172,6 @@ impl VirtualFS {
 	fn stop(&mut self) {
 		if let Some(handle) = self.instance_handle.take() {
 			unsafe {
-				// Remove the state from the global map
-				if let Ok(mut states) = INSTANCE_STATES.lock() {
-					let key = handle.0 as usize;
-					states.remove(&key);
-				}
 				PrjStopVirtualizing(handle);
 			}
 		}
@@ -202,6 +215,11 @@ impl VirtualFS {
 		_callback_data: *const PRJ_CALLBACK_DATA,
 		_enumeration_id: *const GUID,
 	) -> HRESULT {
+		// Initialize enumeration state
+		let guid_str = format!("{:?}", unsafe { *_enumeration_id });
+		if let Ok(mut states) = ENUM_STATES.lock() {
+			states.insert(guid_str, 0);
+		}
 		HRESULT(0)
 	}
 
@@ -209,6 +227,11 @@ impl VirtualFS {
 		_callback_data: *const PRJ_CALLBACK_DATA,
 		_enumeration_id: *const GUID,
 	) -> HRESULT {
+		// Clean up enumeration state
+		let guid_str = format!("{:?}", unsafe { *_enumeration_id });
+		if let Ok(mut states) = ENUM_STATES.lock() {
+			states.remove(&guid_str);
+		}
 		HRESULT(0)
 	}
 
@@ -218,52 +241,87 @@ impl VirtualFS {
 		_search_expression: PCWSTR,
 		dir_entry_buffer_handle: PRJ_DIR_ENTRY_BUFFER_HANDLE,
 	) -> HRESULT {
+		println!("get_dir_enum called");
+		let guid_str = format!("{:?}", unsafe { *_enumeration_id });
+
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
 			return rt.block_on(async move {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
 					let parent_path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
+					println!("Enumerating directory: {}", parent_path);
 
+					let parent_path = parent_path.replace('/', "\\");
+
+					// Get current index for this enumeration
+					let mut current_index = 0;
+					if let Ok(states) = ENUM_STATES.lock() {
+						current_index = *states.get(&guid_str).unwrap_or(&0);
+					}
+
+					// First collect all direct children
+					let mut children = Vec::new();
 					for (path, file) in state.files.iter() {
+						let windows_path = path.replace('/', "\\");
 						let is_direct_child = if parent_path.is_empty() {
-							!path.contains('/')
+							!windows_path.contains('\\')
 						} else {
-							path.starts_with(&format!("{}/", parent_path)) &&
-							path[parent_path.len()+1..].split('/').count() == 1
+							windows_path.starts_with(&format!("{}\\", parent_path)) &&
+							windows_path[parent_path.len()+1..].split('\\').count() == 1
 						};
 
 						if is_direct_child {
-							let name = path.split('/').last().unwrap();
-							let name_wide: Vec<u16> = name.encode_utf16().collect();
-
-							let file_info = PRJ_FILE_BASIC_INFO {
-								IsDirectory: BOOLEAN::from(file.is_directory),
-								FileSize: file.size as i64,
-								CreationTime: 0,
-								LastAccessTime: 0,
-								LastWriteTime: 0,
-								ChangeTime: 0,
-								FileAttributes: if file.is_directory {
-									FILE_ATTRIBUTE_DIRECTORY
-								} else {
-									FILE_ATTRIBUTE_NORMAL
-								},
-								..Default::default()
-							};
-
-							let name_ptr = name_wide.as_ptr();
-							if PrjFillDirEntryBuffer(
-								PCWSTR(name_ptr),
-								Some(&file_info),
-								dir_entry_buffer_handle,
-							).is_err() {
-								return HRESULT(-2147024896); // E_FAIL
-							}
+							let name = windows_path.split('\\').last().unwrap();
+							children.push((name.to_string(), file));
 						}
 					}
+
+					println!("Found {} children", children.len());
+
+					// If we've sent all entries, clean up and return STATUS_END_OF_FILE
+					if current_index >= children.len() {
+						if let Ok(mut states) = ENUM_STATES.lock() {
+							states.remove(&guid_str);
+						}
+						println!("All entries sent, returning STATUS_END_OF_FILE");
+						return HRESULT(-2147483633); // STATUS_END_OF_FILE
+					}
+
+					// Add the next child to the buffer
+					let (name, file) = &children[current_index];
+					let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+					let file_info = PRJ_FILE_BASIC_INFO {
+						IsDirectory: BOOLEAN::from(file.is_directory),
+						FileSize: file.size as i64,
+						CreationTime: Self::system_time_to_file_time(file.mtime),
+						LastAccessTime: Self::system_time_to_file_time(file.mtime),
+						LastWriteTime: Self::system_time_to_file_time(file.mtime),
+						ChangeTime: Self::system_time_to_file_time(file.mtime),
+						FileAttributes: if file.is_directory {
+							FILE_ATTRIBUTE_DIRECTORY
+						} else {
+							FILE_ATTRIBUTE_NORMAL
+						},
+						..Default::default()
+					};
+
+					let result = PrjFillDirEntryBuffer(
+						PCWSTR(name_wide.as_ptr()),
+						Some(&file_info),
+						dir_entry_buffer_handle,
+					);
+
+					// Update the index for next time
+					if let Ok(mut states) = ENUM_STATES.lock() {
+						states.insert(guid_str, current_index + 1);
+					}
+
+					HRESULT(0)
+				} else {
+					HRESULT(-2147483633) // STATUS_END_OF_FILE
 				}
-				HRESULT(0)
 			});
 		}
 		HRESULT(0)
@@ -272,22 +330,36 @@ impl VirtualFS {
 	unsafe extern "system" fn get_placeholder_info(
 		_callback_data: *const PRJ_CALLBACK_DATA,
 	) -> HRESULT {
+		println!("get_placeholder_info called");
+		unsafe {
+			println!("Callback handle: {}", (*_callback_data).NamespaceVirtualizationContext.0 as usize);
+		}
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
 			return rt.block_on(async move {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
 					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
+					println!("Looking up placeholder info for: {}", path);
+					println!("Files in state:");
+					for (p, file) in state.files.iter() {
+						println!("  {} ({})", p, if file.is_directory { "dir" } else { "file" });
+					}
 
-					if let Some(file) = state.files.get(&path) {
+					let path = path.replace('/', "\\");
+					let lookup_path = path.replace('\\', "/");
+					println!("Converted path for lookup: {}", lookup_path);
+
+					if let Some(file) = state.files.get(&lookup_path) {
+						println!("Found file: {} ({})", lookup_path, if file.is_directory { "dir" } else { "file" });
 						let placeholder_info = PRJ_PLACEHOLDER_INFO {
 							FileBasicInfo: PRJ_FILE_BASIC_INFO {
 								IsDirectory: BOOLEAN::from(file.is_directory),
 								FileSize: file.size as i64,
-								CreationTime: 0,
-								LastAccessTime: 0,
-								LastWriteTime: 0,
-								ChangeTime: 0,
+								CreationTime: Self::system_time_to_file_time(file.mtime),
+								LastAccessTime: Self::system_time_to_file_time(file.mtime),
+								LastWriteTime: Self::system_time_to_file_time(file.mtime),
+								ChangeTime: Self::system_time_to_file_time(file.mtime),
 								FileAttributes: if file.is_directory {
 									FILE_ATTRIBUTE_DIRECTORY
 								} else {
@@ -319,14 +391,25 @@ impl VirtualFS {
 		_byte_offset: u64,
 		_length: u32,
 	) -> HRESULT {
+		println!("get_file_data called");
+		unsafe {
+			println!("Callback handle: {}", (*_callback_data).NamespaceVirtualizationContext.0 as usize);
+		}
 		if let Ok(rt) = tokio::runtime::Runtime::new() {
 			return rt.block_on(async move {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
 					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
+					println!("Reading file data for: {}", path);
+					println!("Offset: {}, Length: {}", _byte_offset, _length);
 
-					if let Some(file) = state.files.get(&path) {
+					let path = path.replace('/', "\\");
+					let lookup_path = path.replace('\\', "/");
+					println!("Converted path for lookup: {}", lookup_path);
+
+					if let Some(file) = state.files.get(&lookup_path) {
+						println!("Found file: {} (size: {})", lookup_path, file.size);
 						let start = _byte_offset as usize;
 						let end = std::cmp::min(start + _length as usize, file.content.len());
 
@@ -363,13 +446,32 @@ impl VirtualFS {
 	// Helper function to get state from callback context
 	fn get_state_from_context(callback_data: *const PRJ_CALLBACK_DATA) -> Option<SharedFSState> {
 		unsafe {
-			let instance_handle = (*callback_data).NamespaceVirtualizationContext;
-			let key = instance_handle.0 as usize;
-			if let Ok(states) = INSTANCE_STATES.lock() {
-				states.get(&key).cloned()
+			let context_ptr = (*callback_data).InstanceContext;
+			println!("Context pointer: {:?}", context_ptr);
+			if !context_ptr.is_null() {
+				// Instead of dereferencing and cloning, use the global map with the context pointer as key
+				if let Ok(states) = INSTANCE_STATES.lock() {
+					let key = context_ptr as usize;
+					states.get(&key).cloned()
+				} else {
+					println!("Failed to lock state map");
+					None
+				}
 			} else {
+				println!("Context pointer is null");
 				None
 			}
 		}
+	}
+
+	fn system_time_to_file_time(time: SystemTime) -> i64 {
+		// Windows FILETIME is in 100-nanosecond intervals since January 1, 1601 UTC
+		// First convert to duration since Unix epoch
+		let duration = time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+
+		// Convert Unix timestamp to Windows timestamp
+		// Add number of 100-nanosecond intervals between 1601 and 1970
+		const WINDOWS_UNIX_EPOCH_DIFF: i64 = 116444736000000000;
+		(duration.as_nanos() as i64 / 100) + WINDOWS_UNIX_EPOCH_DIFF
 	}
 }
