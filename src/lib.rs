@@ -84,6 +84,7 @@ impl JsFuseFS {
 			content: content.to_vec(),
 			size: content.len() as u64,
 			is_directory: false,
+			mtime: std::time::SystemTime::now(),
 		});
 		state.emit_event(FSEvent::Created { path, object_type: common::ObjectType::File });
 		Ok(())
@@ -96,6 +97,7 @@ impl JsFuseFS {
 			content: vec![],
 			size: 0,
 			is_directory: true,
+			mtime: std::time::SystemTime::now(),
 		});
 		state.emit_event(FSEvent::Created { path, object_type: common::ObjectType::Directory });
 		Ok(())
