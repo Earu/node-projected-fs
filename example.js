@@ -5,11 +5,7 @@ async function main() {
 	
 	try {
 		// Subscribe to file system events
-		await fs.on((event) => {
-			console.log(`${event.eventType} event:
-- Path: ${event.path}
-- Type: ${event.objectType}`);
-		});
+		fs.on((event) => console.log(`${event.eventType} event:\n- Path: ${event.path}\n- Type: ${event.objectType}`));
 
 		console.log('Creating initial files and directories...');
 		
