@@ -11,7 +11,7 @@ export interface FileSystemEvent {
 export type JsFuseFS = FuseFS
 export declare class FuseFS {
   constructor()
-  mount(path: string): Promise<void>
+  mount(path: string, totalSpaceBytes: number, maxFiles?: number | undefined | null): Promise<void>
   unmount(): Promise<void>
   addFile(path: string, content: Buffer): Promise<void>
   addDirectory(path: string): Promise<void>

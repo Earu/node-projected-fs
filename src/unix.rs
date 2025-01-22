@@ -25,13 +25,22 @@ fn get_user_ids() -> (u32, u32) {
 pub struct FSImpl {
 	session: Option<fuser::BackgroundSession>,
 	state: SharedFSState,
+	pub total_space_bytes: u64,
+	pub max_files: u64,
 }
 
 impl FSImpl {
 	pub fn new(state: SharedFSState) -> Self {
+		// Default to 4GB total space and 1M files
+		Self::with_size(state, 4 * 1024 * 1024 * 1024, 1024 * 1024)
+	}
+
+	pub fn with_size(state: SharedFSState, total_space_bytes: u64, max_files: u64) -> Self {
 		Self { 
 			session: None,
 			state,
+			total_space_bytes,
+			max_files,
 		}
 	}
 
@@ -44,6 +53,8 @@ impl FSImpl {
 		
 		let fs = VirtualFS {
 			state: self.state.clone(),
+			total_space_bytes: self.total_space_bytes,
+			max_files: self.max_files,
 		};
 		
 		match fuser::spawn_mount2(fs, mount_path, &options) {
@@ -66,6 +77,8 @@ impl FSImpl {
 
 struct VirtualFS {
 	state: SharedFSState,
+	total_space_bytes: u64,
+	max_files: u64,
 }
 
 impl Filesystem for VirtualFS {
@@ -129,6 +142,11 @@ impl Filesystem for VirtualFS {
 			let mut found_path = None;
 			let mut is_dir = false;
 			
+			// Calculate current total size
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+			
 			for (path, _) in state.files.iter() {
 				if hash_path(path) == ino {
 					found_path = Some(path.clone());
@@ -140,6 +158,19 @@ impl Filesystem for VirtualFS {
 				if let Some(file) = state.files.get_mut(&path) {
 					let start = offset as usize;
 					let end = start + data.len();
+					
+					// Calculate the size change
+					let size_increase = if end > file.content.len() {
+						(end - file.content.len()) as u64
+					} else {
+						0
+					};
+
+					// Check if this write would exceed the total space limit
+					if total_size + size_increase > self.total_space_bytes {
+						reply.error(libc::ENOSPC);
+						return;
+					}
 					
 					// Ensure the file is large enough
 					if end > file.content.len() {
@@ -172,6 +203,18 @@ impl Filesystem for VirtualFS {
 			let (uid, gid) = get_user_ids();
 			let now = SystemTime::now();
 			
+			// Calculate current total size
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+
+			// Account for metadata size (path and basic struct size)
+			let metadata_size = std::mem::size_of::<crate::common::VirtualFile>() as u64 + name.len() as u64;
+			if total_size + metadata_size > self.total_space_bytes {
+				reply.error(libc::ENOSPC);
+				return;
+			}
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
@@ -216,10 +259,7 @@ impl Filesystem for VirtualFS {
 			};
 
 			state.files.insert(path.clone(), file);
-			state.emit_event(FSEvent::Created { 
-				path,
-				object_type: ObjectType::File
-			});
+			state.emit_event(FSEvent::Created { path, object_type: ObjectType::File });
 			
 			reply.created(&TTL, &attr, 0, 0, 0);
 		});
@@ -426,6 +466,11 @@ impl Filesystem for VirtualFS {
 			let mut found_attr = None;
 			let mut should_emit_event = false;
 
+			// Calculate current total size
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+
 			for (path, _) in state.files.iter() {
 				if hash_path(path) == ino {
 					found_path = Some(path.clone());
@@ -438,6 +483,18 @@ impl Filesystem for VirtualFS {
 				if let Some(file) = state.files.get_mut(&path) {
 					// Handle file size changes (truncation)
 					if let Some(new_size) = size {
+						// Check if this size change would exceed the limit
+						let size_change = if new_size > file.size {
+							new_size - file.size
+						} else {
+							0
+						};
+
+						if total_size + size_change > self.total_space_bytes {
+							reply.error(libc::ENOSPC);
+							return;
+						}
+
 						file.content.resize(new_size as usize, 0);
 						file.size = new_size;
 						file.mtime = now;
@@ -544,6 +601,332 @@ impl Filesystem for VirtualFS {
 				}
 			}
 			reply.error(libc::ENOENT);
+		});
+	}
+
+	fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let mut state = self.state.write().await;
+			let (uid, gid) = get_user_ids();
+			let now = SystemTime::now();
+			
+			// Calculate current total size
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+
+			// Account for directory metadata size (path and basic struct size)
+			let metadata_size = std::mem::size_of::<crate::common::VirtualFile>() as u64 + name.len() as u64;
+			if total_size + metadata_size > self.total_space_bytes {
+				reply.error(libc::ENOSPC);
+				return;
+			}
+			
+			let parent_path = if parent == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == parent) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			let path = if parent_path.is_empty() {
+				name.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", parent_path, name.to_string_lossy())
+			};
+
+			let dir = crate::common::VirtualFile {
+				content: Vec::new(),
+				size: metadata_size, // Store the metadata size for directories
+				is_directory: true,
+				mtime: now,
+			};
+
+			let attr = FileAttr {
+				ino: hash_path(&path),
+				size: 0,
+				blocks: 1,
+				atime: now,
+				mtime: now,
+				ctime: now,
+				crtime: now,
+				kind: FileType::Directory,
+				perm: 0o755,
+				nlink: 2,
+				uid,
+				gid,
+				rdev: 0,
+				flags: 0,
+				blksize: 512,
+			};
+
+			state.files.insert(path.clone(), dir);
+			state.emit_event(FSEvent::Created { path, object_type: ObjectType::Directory });
+			
+			reply.entry(&TTL, &attr, 0);
+		});
+	}
+
+	fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: fuser::ReplyEmpty) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let mut state = self.state.write().await;
+			
+			// Get parent paths
+			let parent_path = if parent == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == parent) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			let new_parent_path = if newparent == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == newparent) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			// Construct old and new paths
+			let old_path = if parent_path.is_empty() {
+				name.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", parent_path, name.to_string_lossy())
+			};
+
+			let new_path = if new_parent_path.is_empty() {
+				newname.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", new_parent_path, newname.to_string_lossy())
+			};
+
+			// Get the file/directory being renamed
+			if let Some(file) = state.files.remove(&old_path) {
+				let is_dir = file.is_directory;
+				
+				// If it's a directory, we need to update all child paths
+				if is_dir {
+					let mut paths_to_rename = Vec::new();
+					for (path, _) in state.files.iter() {
+						if path.starts_with(&format!("{}/", old_path)) {
+							paths_to_rename.push(path.clone());
+						}
+					}
+
+					for old_child_path in paths_to_rename {
+						if let Some(file) = state.files.remove(&old_child_path) {
+							let new_child_path = old_child_path.replacen(&old_path, &new_path, 1);
+							state.files.insert(new_child_path, file);
+						}
+					}
+				}
+
+				// Insert the renamed file/directory
+				state.files.insert(new_path.clone(), file);
+				
+				// Emit events
+				state.emit_event(FSEvent::Deleted {
+					path: old_path,
+					object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
+				});
+				state.emit_event(FSEvent::Created {
+					path: new_path,
+					object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
+				});
+				
+				reply.ok();
+			} else {
+				reply.error(libc::ENOENT);
+			}
+		});
+	}
+
+	fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let mut state = self.state.write().await;
+			
+			let parent_path = if parent == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == parent) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			let path = if parent_path.is_empty() {
+				name.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", parent_path, name.to_string_lossy())
+			};
+
+			// Check if directory exists and is actually a directory
+			match state.files.get(&path) {
+				Some(file) if !file.is_directory => {
+					reply.error(libc::ENOTDIR);
+					return;
+				}
+				None => {
+					reply.error(libc::ENOENT);
+					return;
+				}
+				_ => {}
+			}
+
+			// Check if directory is empty
+			let has_children = state.files.iter().any(|(child_path, _)| {
+				child_path != &path && child_path.starts_with(&format!("{}/", path))
+			});
+
+			if has_children {
+				reply.error(libc::ENOTEMPTY);
+				return;
+			}
+
+			// Remove the directory
+			if state.files.remove(&path).is_some() {
+				state.emit_event(FSEvent::Deleted {
+					path,
+					object_type: ObjectType::Directory
+				});
+				reply.ok();
+			} else {
+				reply.error(libc::ENOENT);
+			}
+		});
+	}
+
+	fn symlink(&mut self, _req: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let mut state = self.state.write().await;
+			let (uid, gid) = get_user_ids();
+			let now = SystemTime::now();
+			
+			// Calculate current total size
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+
+			// Check if adding this symlink would exceed the limit
+			let link_size = link.to_string_lossy().len() as u64;
+			if total_size + link_size > self.total_space_bytes {
+				reply.error(libc::ENOSPC);
+				return;
+			}
+			
+			let parent_path = if parent == 1 {
+				String::new()
+			} else {
+				match state.files.iter().find(|(path, file)| file.is_directory && hash_path(path) == parent) {
+					Some((path, _)) => path.clone(),
+					None => {
+						reply.error(libc::ENOENT);
+						return;
+					}
+				}
+			};
+
+			let path = if parent_path.is_empty() {
+				name.to_string_lossy().into_owned()
+			} else {
+				format!("{}/{}", parent_path, name.to_string_lossy())
+			};
+
+			// Create symlink content (store the target path)
+			let symlink = crate::common::VirtualFile {
+				content: link.to_string_lossy().as_bytes().to_vec(),
+				size: link_size,
+				is_directory: false,
+				mtime: now,
+			};
+
+			let attr = FileAttr {
+				ino: hash_path(&path),
+				size: symlink.size,
+				blocks: 1,
+				atime: now,
+				mtime: now,
+				ctime: now,
+				crtime: now,
+				kind: FileType::Symlink,
+				perm: 0o777,
+				nlink: 1,
+				uid,
+				gid,
+				rdev: 0,
+				flags: 0,
+				blksize: 512,
+			};
+
+			state.files.insert(path.clone(), symlink);
+			state.emit_event(FSEvent::Created {
+				path,
+				object_type: ObjectType::File // Symlinks are treated as special files
+			});
+			
+			reply.entry(&TTL, &attr, 0);
+		});
+	}
+
+	fn readlink(&mut self, _req: &Request, ino: u64, reply: fuser::ReplyData) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			
+			for (path, file) in state.files.iter() {
+				if hash_path(path) == ino {
+					reply.data(&file.content);
+					return;
+				}
+			}
+			
+			reply.error(libc::ENOENT);
+		});
+	}
+
+	fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let state = self.state.read().await;
+			
+			// Calculate total size of all files
+			let total_size: u64 = state.files.values()
+				.map(|file| file.size)
+				.sum();
+
+			// Calculate number of files/directories
+			let total_files = state.files.len() as u64;
+			
+			let block_size: u64 = 4096; // 4KB blocks
+			let total_blocks = self.total_space_bytes / block_size;
+			let used_blocks = (total_size + block_size - 1) / block_size; // Round up
+			let free_blocks = total_blocks.saturating_sub(used_blocks);
+			
+			reply.statfs(
+				total_blocks,
+				free_blocks,
+				free_blocks, // Available blocks (same as free for this virtual fs)
+				self.max_files, // Total files/inodes
+				self.max_files.saturating_sub(total_files), // Free inodes
+				block_size as u32,
+				255, // Maximum name length
+				0,   // Fragment size (unused)
+			);
 		});
 	}
 }
