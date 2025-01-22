@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug)]
 pub enum ObjectType {
@@ -15,11 +16,22 @@ pub enum FSEvent {
 	Deleted { path: String, object_type: ObjectType },
 }
 
-#[derive(Default)]
 pub struct VirtualFile {
 	pub content: Vec<u8>,
 	pub size: u64,
 	pub is_directory: bool,
+	pub mtime: SystemTime,
+}
+
+impl Default for VirtualFile {
+	fn default() -> Self {
+		Self {
+			content: Vec::new(),
+			size: 0,
+			is_directory: false,
+			mtime: SystemTime::now(),
+		}
+	}
 }
 
 impl VirtualFile {
