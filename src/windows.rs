@@ -247,8 +247,7 @@ impl VirtualFS {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
-					let parent_path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
-					let parent_path = parent_path.replace('/', "\\");
+					let parent_path = Self::get_string_from_pcwstr((*_callback_data).FilePathName).replace('\\', "/");
 
 					// Get current index for this enumeration
 					let mut current_index = 0;
@@ -259,16 +258,15 @@ impl VirtualFS {
 					// First collect all direct children
 					let mut children = Vec::new();
 					for (path, file) in state.files.iter() {
-						let windows_path = path.replace('/', "\\");
 						let is_direct_child = if parent_path.is_empty() {
-							!windows_path.contains('\\')
+							!path.contains('/')
 						} else {
-							windows_path.starts_with(&format!("{}\\", parent_path)) &&
-							windows_path[parent_path.len()+1..].split('\\').count() == 1
+							path.starts_with(&format!("{}/", parent_path)) &&
+							path[parent_path.len()+1..].split('/').count() == 1
 						};
 
 						if is_direct_child {
-							let name = windows_path.split('\\').last().unwrap();
+							let name = path.split('/').last().unwrap();
 							children.push((name.to_string(), file));
 						}
 					}
@@ -300,11 +298,15 @@ impl VirtualFS {
 						..Default::default()
 					};
 
-					let _ = PrjFillDirEntryBuffer(
+					let result = PrjFillDirEntryBuffer(
 						PCWSTR(name_wide.as_ptr()),
 						Some(&file_info),
 						dir_entry_buffer_handle,
 					);
+
+					if result.is_err() {
+						return HRESULT(-2147024896); // E_FAIL
+					}
 
 					// Update the index for next time
 					if let Ok(mut states) = ENUM_STATES.lock() {
@@ -328,7 +330,7 @@ impl VirtualFS {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
-					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
+					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName).replace('\\', "/");
 
 					if let Some(file) = state.files.get(&path) {
 						let placeholder_info = PRJ_PLACEHOLDER_INFO {
@@ -346,7 +348,14 @@ impl VirtualFS {
 								},
 								..Default::default()
 							},
-							..Default::default()
+							VariableData: [0; 1],
+							EaInformation: Default::default(),
+							SecurityInformation: Default::default(),
+							StreamsInformation: Default::default(),
+							VersionInfo: PRJ_PLACEHOLDER_VERSION_INFO {
+								ProviderID: [0; 128],
+								ContentID: [0; 128],
+							},
 						};
 
 						if PrjWritePlaceholderInfo(
@@ -357,12 +366,14 @@ impl VirtualFS {
 						).is_err() {
 							return HRESULT(-2147024896); // E_FAIL
 						}
+						return HRESULT(0);
 					}
+					return HRESULT(-2147024894); // E_FILE_NOT_FOUND
 				}
-				HRESULT(0)
+				HRESULT(-2147024894) // E_FILE_NOT_FOUND
 			});
 		}
-		HRESULT(0)
+		HRESULT(-2147024894) // E_FILE_NOT_FOUND
 	}
 
 	unsafe extern "system" fn get_file_data(
@@ -375,7 +386,7 @@ impl VirtualFS {
 				let state = Self::get_state_from_context(_callback_data);
 				if let Some(state) = state {
 					let state = state.read().await;
-					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName);
+					let path = Self::get_string_from_pcwstr((*_callback_data).FilePathName).replace('\\', "/");
 
 					if let Some(file) = state.files.get(&path) {
 						let start = _byte_offset as usize;
@@ -385,7 +396,7 @@ impl VirtualFS {
 							let data = &file.content[start..end];
 							let result = PrjWriteFileData(
 								(*_callback_data).NamespaceVirtualizationContext,
-								(*_callback_data).FilePathName.0 as *const _,
+								&(*_callback_data).DataStreamId,
 								data.as_ptr() as *const _,
 								_byte_offset,
 								data.len() as u32,
