@@ -7,6 +7,8 @@ use fuser::{
 	Request, ReplyWrite, ReplyCreate, TimeOrNow,
 };
 use napi::bindgen_prelude::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -23,7 +25,7 @@ fn get_user_ids() -> (u32, u32) {
 }
 
 pub struct FSImpl {
-	session: Option<fuser::BackgroundSession>,
+	sessions: HashMap<PathBuf, fuser::BackgroundSession>,
 	state: SharedFSState,
 	pub total_space_bytes: u64,
 	pub max_files: u64,
@@ -36,8 +38,8 @@ impl FSImpl {
 	}
 
 	pub fn with_size(state: SharedFSState, total_space_bytes: u64, max_files: u64) -> Self {
-		Self { 
-			session: None,
+		Self {
+			sessions: HashMap::new(),
 			state,
 			total_space_bytes,
 			max_files,
@@ -50,16 +52,16 @@ impl FSImpl {
 			MountOption::DefaultPermissions,
 			MountOption::AutoUnmount,
 		];
-		
+
 		let fs = VirtualFS {
 			state: self.state.clone(),
 			total_space_bytes: self.total_space_bytes,
 			max_files: self.max_files,
 		};
-		
+
 		match fuser::spawn_mount2(fs, mount_path, &options) {
 			Ok(session) => {
-				self.session = Some(session);
+				self.sessions.insert(mount_path.to_path_buf(), session);
 				Ok(())
 			},
 			Err(e) => {
@@ -69,8 +71,17 @@ impl FSImpl {
 		}
 	}
 
-	pub async fn unmount(&mut self) -> Result<()> {
-		self.session.take();
+	pub async fn unmount(&mut self, mount_path: &Path) -> Result<()> {
+		if let Some(_) = self.sessions.remove(mount_path) {
+			// Session is dropped here, which automatically unmounts
+			Ok(())
+		} else {
+			Err(Error::from_reason("Mount point not found"))
+		}
+	}
+
+	pub async fn unmount_all(&mut self) -> Result<()> {
+		self.sessions.clear();  // Drop all sessions
 		Ok(())
 	}
 }
@@ -86,14 +97,14 @@ impl Filesystem for VirtualFS {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
 			let (uid, gid) = get_user_ids();
-			
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
 				let parent_path = state.files.iter()
 					.find(|(path, file)| file.is_directory && hash_path(path) == parent)
 					.map(|(path, _)| path.clone());
-				
+
 				match parent_path {
 					Some(path) => path,
 					None => {
@@ -138,15 +149,15 @@ impl Filesystem for VirtualFS {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
 			let now = SystemTime::now();
-			
+
 			let mut found_path = None;
 			let mut is_dir = false;
-			
+
 			// Calculate current total size
 			let total_size: u64 = state.files.values()
 				.map(|file| file.size)
 				.sum();
-			
+
 			for (path, _) in state.files.iter() {
 				if hash_path(path) == ino {
 					found_path = Some(path.clone());
@@ -158,7 +169,7 @@ impl Filesystem for VirtualFS {
 				if let Some(file) = state.files.get_mut(&path) {
 					let start = offset as usize;
 					let end = start + data.len();
-					
+
 					// Calculate the size change
 					let size_increase = if end > file.content.len() {
 						(end - file.content.len()) as u64
@@ -171,12 +182,12 @@ impl Filesystem for VirtualFS {
 						reply.error(libc::ENOSPC);
 						return;
 					}
-					
+
 					// Ensure the file is large enough
 					if end > file.content.len() {
 						file.content.resize(end, 0);
 					}
-					
+
 					// Write the data
 					file.content[start..end].copy_from_slice(data);
 					file.size = file.content.len() as u64;
@@ -185,11 +196,11 @@ impl Filesystem for VirtualFS {
 				}
 
 				// Emit modification event outside the mutable borrow scope
-				state.emit_event(FSEvent::Modified { 
+				state.emit_event(FSEvent::Modified {
 					path,
 					object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
 				});
-				
+
 				reply.written(data.len() as u32);
 				return;
 			}
@@ -202,7 +213,7 @@ impl Filesystem for VirtualFS {
 			let mut state = self.state.write().await;
 			let (uid, gid) = get_user_ids();
 			let now = SystemTime::now();
-			
+
 			// Calculate current total size
 			let total_size: u64 = state.files.values()
 				.map(|file| file.size)
@@ -260,7 +271,7 @@ impl Filesystem for VirtualFS {
 
 			state.files.insert(path.clone(), file);
 			state.emit_event(FSEvent::Created { path, object_type: ObjectType::File });
-			
+
 			reply.created(&TTL, &attr, 0, 0, 0);
 		});
 	}
@@ -268,7 +279,7 @@ impl Filesystem for VirtualFS {
 	fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
-			
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
@@ -288,7 +299,7 @@ impl Filesystem for VirtualFS {
 			};
 
 			if let Some(file) = state.files.remove(&path) {
-				state.emit_event(FSEvent::Deleted { 
+				state.emit_event(FSEvent::Deleted {
 					path,
 					object_type: file.get_type()
 				});
@@ -302,7 +313,7 @@ impl Filesystem for VirtualFS {
 	fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
 		let (uid, gid) = get_user_ids();
 		let now = SystemTime::now();
-		
+
 		if ino == 1 {
 			let attr = FileAttr {
 				ino: 1,
@@ -416,7 +427,7 @@ impl Filesystem for VirtualFS {
 				let is_direct_child = if dir_path.is_empty() {
 					!path.contains('/')
 				} else {
-					path.starts_with(&format!("{}/", dir_path)) && 
+					path.starts_with(&format!("{}/", dir_path)) &&
 					path[dir_path.len()+1..].split('/').count() == 1
 				};
 
@@ -537,7 +548,7 @@ impl Filesystem for VirtualFS {
 				}
 
 				if should_emit_event {
-					state.emit_event(FSEvent::Modified { 
+					state.emit_event(FSEvent::Modified {
 						path,
 						object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
 					});
@@ -609,7 +620,7 @@ impl Filesystem for VirtualFS {
 			let mut state = self.state.write().await;
 			let (uid, gid) = get_user_ids();
 			let now = SystemTime::now();
-			
+
 			// Calculate current total size
 			let total_size: u64 = state.files.values()
 				.map(|file| file.size)
@@ -621,7 +632,7 @@ impl Filesystem for VirtualFS {
 				reply.error(libc::ENOSPC);
 				return;
 			}
-			
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
@@ -667,7 +678,7 @@ impl Filesystem for VirtualFS {
 
 			state.files.insert(path.clone(), dir);
 			state.emit_event(FSEvent::Created { path, object_type: ObjectType::Directory });
-			
+
 			reply.entry(&TTL, &attr, 0);
 		});
 	}
@@ -675,7 +686,7 @@ impl Filesystem for VirtualFS {
 	fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: fuser::ReplyEmpty) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
-			
+
 			// Get parent paths
 			let parent_path = if parent == 1 {
 				String::new()
@@ -717,7 +728,7 @@ impl Filesystem for VirtualFS {
 			// Get the file/directory being renamed
 			if let Some(file) = state.files.remove(&old_path) {
 				let is_dir = file.is_directory;
-				
+
 				// If it's a directory, we need to update all child paths
 				if is_dir {
 					let mut paths_to_rename = Vec::new();
@@ -737,7 +748,7 @@ impl Filesystem for VirtualFS {
 
 				// Insert the renamed file/directory
 				state.files.insert(new_path.clone(), file);
-				
+
 				// Emit events
 				state.emit_event(FSEvent::Deleted {
 					path: old_path,
@@ -747,7 +758,7 @@ impl Filesystem for VirtualFS {
 					path: new_path,
 					object_type: if is_dir { ObjectType::Directory } else { ObjectType::File }
 				});
-				
+
 				reply.ok();
 			} else {
 				reply.error(libc::ENOENT);
@@ -758,7 +769,7 @@ impl Filesystem for VirtualFS {
 	fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let mut state = self.state.write().await;
-			
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
@@ -818,7 +829,7 @@ impl Filesystem for VirtualFS {
 			let mut state = self.state.write().await;
 			let (uid, gid) = get_user_ids();
 			let now = SystemTime::now();
-			
+
 			// Calculate current total size
 			let total_size: u64 = state.files.values()
 				.map(|file| file.size)
@@ -830,7 +841,7 @@ impl Filesystem for VirtualFS {
 				reply.error(libc::ENOSPC);
 				return;
 			}
-			
+
 			let parent_path = if parent == 1 {
 				String::new()
 			} else {
@@ -880,7 +891,7 @@ impl Filesystem for VirtualFS {
 				path,
 				object_type: ObjectType::File // Symlinks are treated as special files
 			});
-			
+
 			reply.entry(&TTL, &attr, 0);
 		});
 	}
@@ -888,14 +899,14 @@ impl Filesystem for VirtualFS {
 	fn readlink(&mut self, _req: &Request, ino: u64, reply: fuser::ReplyData) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
-			
+
 			for (path, file) in state.files.iter() {
 				if hash_path(path) == ino {
 					reply.data(&file.content);
 					return;
 				}
 			}
-			
+
 			reply.error(libc::ENOENT);
 		});
 	}
@@ -903,7 +914,7 @@ impl Filesystem for VirtualFS {
 	fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let state = self.state.read().await;
-			
+
 			// Calculate total size of all files
 			let total_size: u64 = state.files.values()
 				.map(|file| file.size)
@@ -911,12 +922,12 @@ impl Filesystem for VirtualFS {
 
 			// Calculate number of files/directories
 			let total_files = state.files.len() as u64;
-			
+
 			let block_size: u64 = 4096; // 4KB blocks
 			let total_blocks = self.total_space_bytes / block_size;
 			let used_blocks = (total_size + block_size - 1) / block_size; // Round up
 			let free_blocks = total_blocks.saturating_sub(used_blocks);
-			
+
 			reply.statfs(
 				total_blocks,
 				free_blocks,
@@ -937,4 +948,4 @@ fn hash_path(path: &str) -> u64 {
 	let mut hasher = DefaultHasher::new();
 	path.hash(&mut hasher);
 	hasher.finish()
-} 
+}

@@ -3,6 +3,23 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
+function findFiles(dirPath) {
+	const results = [];
+	const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+
+	for (const entry of entries) {
+		const fullPath = path.join(dirPath, entry.name);
+
+		if (entry.isDirectory()) {
+			results.push(...findFiles(fullPath));
+		} else {
+			results.push(fullPath);
+		}
+	}
+
+	return results;
+}
+
 async function main() {
 	const fs_impl = new FuseFS();
 
@@ -59,6 +76,14 @@ async function main() {
 						await fs_impl.removePath("hello.txt");
 						await fs_impl.removePath("newdir/nested.txt");
 						await fs_impl.removePath("newdir");
+
+						try {
+							console.log('\nListing files in mounted directory...');
+							const files = findFiles(mountPath);
+							console.log(files);
+						} catch (error) {
+							console.error('Error listing files:', error);
+						}
 					}, 2000);
 				}, 2000);
 			}, 2000);

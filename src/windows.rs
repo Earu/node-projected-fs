@@ -10,17 +10,11 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use std::time::SystemTime;
+use uuid::Uuid;
+use std::path::PathBuf;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-
-// Define a static GUID for our provider
-static PROVIDER_GUID: GUID = GUID::from_values(
-	0x2e7dacb1,
-	0x8a87,
-	0x4c61,
-	[0x93, 0x2c, 0x47, 0x90, 0x60, 0x5a, 0xb7, 0x9f],
-);
 
 // Global state mapping using the raw pointer value as the key
 static INSTANCE_STATES: Lazy<Mutex<HashMap<usize, SharedFSState>>> =
@@ -30,24 +24,38 @@ static INSTANCE_STATES: Lazy<Mutex<HashMap<usize, SharedFSState>>> =
 static ENUM_STATES: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub struct FSImpl {
-	session: Option<VirtualFS>,
+	sessions: HashMap<PathBuf, VirtualFS>,
 	state: SharedFSState,
 	pub total_space_bytes: u64,
 	pub max_files: u64,
+	provider_guid: GUID,
 }
 
 impl FSImpl {
 	pub fn new(state: SharedFSState) -> Self {
-		// Default to 4GB total space and 1M files like Unix
 		Self::with_size(state, 4 * 1024 * 1024 * 1024, 1024 * 1024)
 	}
 
-	pub fn with_size(state: SharedFSState, total_space_bytes: u64, max_files: u64) -> Self {
+	pub fn with_size(
+		state: SharedFSState,
+		total_space_bytes: u64,
+		max_files: u64,
+	) -> Self {
+		// Generate a random UUID and convert it to Windows GUID
+		let uuid = Uuid::new_v4();
+		let provider_guid = GUID::from_values(
+			uuid.as_fields().0,
+			uuid.as_fields().1,
+			uuid.as_fields().2,
+			uuid.as_fields().3.clone(),
+		);
+
 		Self {
-			session: None,
+			sessions: HashMap::new(),
 			state,
 			total_space_bytes,
 			max_files,
+			provider_guid,
 		}
 	}
 
@@ -56,19 +64,20 @@ impl FSImpl {
 			self.state.clone(),
 			self.total_space_bytes,
 			self.max_files,
+			self.provider_guid,
 		);
 
 		match fs.start(mount_path) {
 			Ok(()) => {
-				self.session = Some(fs);
+				self.sessions.insert(mount_path.to_path_buf(), fs);
 				Ok(())
 			},
 			Err(e) => Err(Error::from_reason(format!("Mount failed: {:?}", e)))
 		}
 	}
 
-	pub async fn unmount(&mut self) -> Result<()> {
-		if let Some(mut fs) = self.session.take() {
+	pub async fn unmount(&mut self, mount_path: &Path) -> Result<()> {
+		if let Some(mut fs) = self.sessions.remove(mount_path) {
 			fs.stop();
 		}
 		Ok(())
@@ -80,15 +89,22 @@ struct VirtualFS {
 	total_space_bytes: u64,
 	max_files: u64,
 	instance_handle: Option<PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT>,
+	provider_guid: GUID,
 }
 
 impl VirtualFS {
-	fn new(state: SharedFSState, total_space_bytes: u64, max_files: u64) -> Self {
+	fn new(
+		state: SharedFSState,
+		total_space_bytes: u64,
+		max_files: u64,
+		provider_guid: GUID,
+	) -> Self {
 		Self {
 			state,
 			total_space_bytes,
 			max_files,
 			instance_handle: None,
+			provider_guid,
 		}
 	}
 
@@ -108,9 +124,9 @@ impl VirtualFS {
 
 			let result = PrjMarkDirectoryAsPlaceholder(
 				PCWSTR(root_path_wide.as_ptr()),
-				None,  // No target path needed
+				None,
 				Some(&version_info),
-				&PROVIDER_GUID,
+				&self.provider_guid,
 			);
 
 			if let Err(e) = result {
