@@ -65,7 +65,7 @@ impl JsFuseFS {
 			*fs = FSImpl::with_size(
 				self.state.clone(),
 				total_space_bytes as u64,
-				1024 * 1024, // Default max files, not exposed to JS
+				1024 * 1024 // Default max files, not exposed to JS
 			);
 		}
 
@@ -75,7 +75,8 @@ impl JsFuseFS {
 			rt.block_on(async {
 				inner.lock().await.mount(&mount_path).await?;
 				rx.await.ok();
-				inner.lock().await.unmount().await
+				let mount_path = mount_path.clone();
+				inner.lock().await.unmount(&mount_path).await
 			}).unwrap_or_else(|e| eprintln!("Mount error: {}", e));
 		});
 
@@ -93,15 +94,15 @@ impl JsFuseFS {
 	#[napi]
 	pub async fn add_file(&self, path: String, content: Buffer) -> Result<()> {
 		let mut state = self.state.write().await;
-		
+
 		// Calculate current total size
 		let total_size: u64 = state.files.values()
 			.map(|file| file.size)
 			.sum();
-		
+
 		// Get the configured size limit
 		let size_limit = self.inner.lock().await.total_space_bytes;
-		
+
 		// Check if adding this file would exceed the limit
 		if total_size + content.len() as u64 > size_limit {
 			return Err(Error::from_reason("No space left on device"));
@@ -142,7 +143,7 @@ impl JsFuseFS {
 	#[napi(js_name = "on")]
 	pub fn on_fs_event(&self, callback: JsFunction) -> Result<()> {
 		let state = self.state.clone();
-		let tsfn: ThreadsafeFunction<_, napi::threadsafe_function::ErrorStrategy::Fatal> = 
+		let tsfn: ThreadsafeFunction<_, napi::threadsafe_function::ErrorStrategy::Fatal> =
 			callback.create_threadsafe_function(0, |ctx| {
 				let event = ctx.value;
 				Ok(vec![event])
@@ -178,4 +179,4 @@ impl JsFuseFS {
 
 		Ok(())
 	}
-} 
+}
